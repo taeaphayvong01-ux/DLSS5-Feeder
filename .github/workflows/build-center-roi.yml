@@ -1,0 +1,87 @@
+name: build-center-roi
+
+on:
+  push:
+    branches: [center-roi-1.17.0]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apply-and-build:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: center-roi-1.17.0
+          fetch-depth: 0
+
+      - name: Apply Center ROI patch
+        shell: powershell
+        run: |
+          $bytes = [Convert]::FromBase64String((Get-Content center-roi.patch.gz.b64 -Raw).Trim())
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\center-roi.patch.gz", $bytes)
+          gzip -dc "$env:RUNNER_TEMP\center-roi.patch.gz" > "$env:RUNNER_TEMP\center-roi.patch"
+          git apply --check "$env:RUNNER_TEMP\center-roi.patch"
+          git apply "$env:RUNNER_TEMP\center-roi.patch"
+          Select-String -Path src\dlss5-feed.cpp -Pattern "CenterROI-r1"
+
+      - name: Resolve dependency revisions
+        id: deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          ngx=$(git ls-remote https://github.com/NVIDIA/DLSS.git HEAD | cut -f1)
+          vk=$(git ls-remote https://github.com/KhronosGroup/Vulkan-Headers.git HEAD | cut -f1)
+          echo "ngx=$ngx" >> "$GITHUB_OUTPUT"
+          echo "vk=$vk" >> "$GITHUB_OUTPUT"
+
+      - name: Cache external headers
+        id: cache-external
+        uses: actions/cache@v4
+        with:
+          path: |
+            external/ngx
+            external/vulkan
+          key: external-v2-${{ runner.os }}-ngx-${{ steps.deps.outputs.ngx }}-vk-${{ steps.deps.outputs.vk }}
+
+      - name: Fetch the NGX SDK
+        if: steps.cache-external.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout --depth 1 https://github.com/NVIDIA/DLSS.git "$RUNNER_TEMP/dlss"
+          git -C "$RUNNER_TEMP/dlss" sparse-checkout set --no-cone '/include/**' '/lib/**'
+          git -C "$RUNNER_TEMP/dlss" checkout
+          mkdir -p external/ngx/libs
+          find "$RUNNER_TEMP/dlss" -name 'nvsdk_ngx*.h' -exec cp {} external/ngx/ ';'
+          cp "$RUNNER_TEMP/dlss/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib" external/ngx/libs/
+
+      - name: Fetch Vulkan headers
+        if: steps.cache-external.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git "$RUNNER_TEMP/vkh"
+          mkdir -p external/vulkan/vulkan external/vulkan/vk_video
+          cp "$RUNNER_TEMP/vkh"/include/vulkan/*.h external/vulkan/vulkan/
+          cp "$RUNNER_TEMP/vkh"/include/vk_video/*.h external/vulkan/vk_video/
+
+      - name: Build modified 64-bit feeder
+        shell: cmd
+        run: call tools\build.bat
+
+      - name: Collect modified add-on
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          Copy-Item build\dlss5-feed.addon64 artifacts\dlss5-feed.addon64
+          Get-FileHash artifacts\dlss5-feed.addon64 -Algorithm SHA256 | Format-List
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dlss5-feeder-center-roi
+          path: artifacts/dlss5-feed.addon64
+          if-no-files-found: error
