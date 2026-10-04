@@ -18,13 +18,10 @@ jobs:
           ref: center-roi-v2-1.17.0
           fetch-depth: 0
 
-      - name: Apply Center ROI v2 patch
+      - name: Verify Center ROI v2 source
         shell: bash
         run: |
           set -euo pipefail
-          base64 -d center-roi-v2.patch.gz.b64 | gzip -dc > "$RUNNER_TEMP/center-roi-v2.patch"
-          git apply --check "$RUNNER_TEMP/center-roi-v2.patch"
-          git apply "$RUNNER_TEMP/center-roi-v2.patch"
           grep -n "CenterROI-r2" src/dlss5-feed.cpp
 
       - name: Resolve dependency revisions
