@@ -67,7 +67,7 @@
 #include "feed_pq12.h" // the D3D12 PQ<->linear pass, for the transports with no shaders of their own
 #include "feed_hold12.h" // the output stabiliser: one compute pass after the evaluate, all four transports
 
-#define FEED_VERSION "1.17.0"
+#define FEED_VERSION "1.17.0-CenterROI-r2"
 #ifndef FEED_BUILD_ID
 #define FEED_BUILD_ID "unknown"
 #endif
@@ -1043,11 +1043,20 @@ struct Cfg
                            // answer shows as is. Same key and meaning as the 32-bit add-on's.
     float hold_tolerance;  // relative input change (0.04 = 4 percent of local brightness) below which a
                            // pixel counts as still; the gate opens fully at twice this.
+
+    // Center ROI v2: D3D11 only. Unlike r1, this never resizes/crops the feeder resources.
+    // The stock full-frame textures and coordinate system remain intact; NGX receives a subrect
+    // inside those resources and writes into the matching output subrect. ROI OFF is stock 1.17.0.
+    int   roi_enabled;
+    int   roi_width;
+    int   roi_height;
+    int   roi_center_y;
 };
 
 static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 100, 0, 0.3f, 2000, 1, 0, 0, 0, 0, 1.0f, 1.0f, 50, 1, 0, 1, 0,
                      /* hdr_bridge */ -1, /* hdr_paper_white */ 203.0f, /* native_dlss_ok */ 0, /* settle_evals */ 0,
-                     /* hold_strength */ 0.0f, /* hold_tolerance */ 0.04f };
+                     /* hold_strength */ 0.0f, /* hold_tolerance */ 0.04f,
+                     /* roi_enabled */ 0, /* roi_width */ 55, /* roi_height */ 65, /* roi_center_y */ 45 };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -1092,13 +1101,18 @@ static void CfgWriteDefault()
             "hdr_paper_white=%.0f\n"
             "settle_evals=%d\n"
             "hold_strength=%.3f\n"
-            "hold_tolerance=%.3f\n",
+            "hold_tolerance=%.3f\n"
+            "roi_enabled=%d\n"
+            "roi_width=%d\n"
+            "roi_height=%d\n"
+            "roi_center_y=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
             g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
             g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.async_home,
             g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.stall_log_ms,
-            g_cfg.hdr_bridge, g_cfg.hdr_paper_white, g_cfg.settle_evals, g_cfg.hold_strength, g_cfg.hold_tolerance);
+            g_cfg.hdr_bridge, g_cfg.hdr_paper_white, g_cfg.settle_evals, g_cfg.hold_strength, g_cfg.hold_tolerance,
+            g_cfg.roi_enabled, g_cfg.roi_width, g_cfg.roi_height, g_cfg.roi_center_y);
     fclose(f);
     Log("[feed] wrote default config to %s", path);
 }
@@ -1152,6 +1166,10 @@ static bool CfgReload()
         else if (_stricmp(key, "settle_evals")   == 0) next.settle_evals   = iv;
         else if (_stricmp(key, "hold_strength")  == 0) next.hold_strength  = val;
         else if (_stricmp(key, "hold_tolerance") == 0) next.hold_tolerance = val;
+        else if (_stricmp(key, "roi_enabled")    == 0) next.roi_enabled    = iv;
+        else if (_stricmp(key, "roi_width")      == 0) next.roi_width      = iv;
+        else if (_stricmp(key, "roi_height")     == 0) next.roi_height     = iv;
+        else if (_stricmp(key, "roi_center_y")   == 0) next.roi_center_y   = iv;
     }
     fclose(f);
     if (next.mode < 0 || next.mode > 2) next.mode = g_cfg.mode;
@@ -1161,6 +1179,10 @@ static bool CfgReload()
     if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
     if (next.work_upscale < 0 || next.work_upscale > 2) next.work_upscale = g_cfg.work_upscale;
     if (next.work_sharpness < 0.0f || next.work_sharpness > 1.0f) next.work_sharpness = g_cfg.work_sharpness;
+    if (next.roi_enabled != 0 && next.roi_enabled != 1) next.roi_enabled = g_cfg.roi_enabled;
+    if (next.roi_width < 25 || next.roi_width > 100) next.roi_width = g_cfg.roi_width;
+    if (next.roi_height < 25 || next.roi_height > 100) next.roi_height = g_cfg.roi_height;
+    if (next.roi_center_y < 20 || next.roi_center_y > 80) next.roi_center_y = g_cfg.roi_center_y;
     if (next.jitter_sign != 1 && next.jitter_sign != -1) next.jitter_sign = g_cfg.jitter_sign;
     if (next.jitter_phases < 0 || next.jitter_phases > 128) next.jitter_phases = g_cfg.jitter_phases;
     // 0 would mean "give up instantly"; an unbounded wait would hang the game on a
@@ -1179,7 +1201,8 @@ static bool CfgReload()
                          // Both of these decide what format the shared textures are made in,
                          // so neither can be picked up without rebuilding them.
                          next.hdr_bridge != g_cfg.hdr_bridge ||
-                         next.hdr_paper_white != g_cfg.hdr_paper_white;
+                         next.hdr_paper_white != g_cfg.hdr_paper_white ||
+                         next.roi_enabled != g_cfg.roi_enabled;
     const bool changed = rebuild || memcmp(&next, &g_cfg, sizeof(Cfg)) != 0;
     if (!changed) return false;
     g_cfg = next;
@@ -1192,6 +1215,8 @@ static bool CfgReload()
         g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.async_home,
         g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.stall_log_ms, g_cfg.settle_evals);
     Log("[feed] config: hold_strength=%.2f hold_tolerance=%.3f", g_cfg.hold_strength, g_cfg.hold_tolerance);
+    Log("[feed] config: center_roi_v2=%d size=%d%%x%d%% center_y=%d%%",
+        g_cfg.roi_enabled, g_cfg.roi_width, g_cfg.roi_height, g_cfg.roi_center_y);
     return rebuild;
 }
 
@@ -1203,7 +1228,7 @@ static const char *const kCfgSavedKeys[] = {
     "rebuild", "log_frames", "create_delay", "preset", "work_resolution", "work_upscale",
     "work_sharpness", "gpu_timeout_ms", "buffer_home", "async_home", "sync_home",
     "mv_scale_x", "mv_scale_y", "stall_log_ms", "hdr_bridge", "hdr_paper_white", "settle_evals",
-    "hold_strength", "hold_tolerance",
+    "hold_strength", "hold_tolerance", "roi_enabled", "roi_width", "roi_height", "roi_center_y",
 };
 
 static bool CfgKeyIsSaved(const char *key)
@@ -1257,13 +1282,15 @@ static void CfgSave()
     fprintf(f,
         "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nwarmup_rebuild=%d\n"
             "rebuild=%d\nlog_frames=%d\ncreate_delay=%d\npreset=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\ngpu_timeout_ms=%d\n"
-            "buffer_home=%d\nasync_home=%d\nsync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\nstall_log_ms=%d\nhdr_bridge=%d\nhdr_paper_white=%.0f\nsettle_evals=%d\nhold_strength=%.3f\nhold_tolerance=%.3f\n",
+            "buffer_home=%d\nasync_home=%d\nsync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\nstall_log_ms=%d\nhdr_bridge=%d\nhdr_paper_white=%.0f\nsettle_evals=%d\nhold_strength=%.3f\nhold_tolerance=%.3f\n"
+            "roi_enabled=%d\nroi_width=%d\nroi_height=%d\nroi_center_y=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
             g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
             g_cfg.gpu_timeout_ms, g_cfg.buffer_home, g_cfg.async_home,
             g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.stall_log_ms,
-            g_cfg.hdr_bridge, g_cfg.hdr_paper_white, g_cfg.settle_evals, g_cfg.hold_strength, g_cfg.hold_tolerance);
+            g_cfg.hdr_bridge, g_cfg.hdr_paper_white, g_cfg.settle_evals, g_cfg.hold_strength, g_cfg.hold_tolerance,
+            g_cfg.roi_enabled, g_cfg.roi_width, g_cfg.roi_height, g_cfg.roi_center_y);
     if (!carried.empty()) fputs(carried.c_str(), f);
     fclose(f);
 }
@@ -4136,6 +4163,23 @@ static bool PickSrQuality(UINT w, UINT h, UINT out_w, UINT out_h)
     return false;
 }
 
+static void CenterRoi(UINT full_w, UINT full_h, UINT *x, UINT *y, UINT *w, UINT *h)
+{
+    UINT rw = static_cast<UINT>((static_cast<UINT64>(full_w) * static_cast<UINT>(g_cfg.roi_width)) / 100u);
+    UINT rh = static_cast<UINT>((static_cast<UINT64>(full_h) * static_cast<UINT>(g_cfg.roi_height)) / 100u);
+    rw = (rw < 2u) ? 2u : (rw > full_w ? full_w : rw);
+    rh = (rh < 2u) ? 2u : (rh > full_h ? full_h : rh);
+    if (rw > 2u) rw &= ~1u;
+    if (rh > 2u) rh &= ~1u;
+    const UINT rx = (full_w - rw) / 2u;
+    int cy = static_cast<int>((static_cast<UINT64>(full_h) * static_cast<UINT>(g_cfg.roi_center_y)) / 100u);
+    int ry = cy - static_cast<int>(rh / 2u);
+    if (ry < 0) ry = 0;
+    const int max_y = static_cast<int>(full_h - rh);
+    if (ry > max_y) ry = max_y;
+    *x = rx; *y = static_cast<UINT>(ry); *w = rw; *h = rh;
+}
+
 static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
 {
     if (crashed != nullptr) *crashed = false;
@@ -4156,7 +4200,7 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
     cp.Feature.InTargetHeight     = target_h;
     cp.Feature.InPerfQualityValue = sr ? static_cast<NVSDK_NGX_PerfQuality_Value>(g.sr_quality) : NVSDK_NGX_PerfQuality_Value_DLAA;
     cp.InFeatureCreateFlags       = flags;
-    cp.InEnableOutputSubrects     = false;
+    cp.InEnableOutputSubrects     = g_cfg.roi_enabled != 0;
 
     // Render-preset hint: presets differ in how aggressively history is clamped, which is
     // both a diagnostic and a partial mitigation for warping around transparents (dust,
@@ -8022,8 +8066,21 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
                 // one and the shared Output receives a copy below. Only the resource NGX
                 // actually writes gets promoted to UNORDERED_ACCESS.
                 ID3D12Resource *const nr_out = g.out_scratch != nullptr ? g.out_scratch : g.tex12[SLOT_OUTPUT];
-                BarrierNamed(g.out_scratch != nullptr ? "private Output" : "Output", nr_out,
-                             D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                if (g_cfg.roi_enabled != 0 && !g.sr_active && g.width == g.backbuffer_width && g.height == g.backbuffer_height)
+                {
+                    Barrier(g.tex12[SLOT_COLOR], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    BarrierNamed(g.out_scratch != nullptr ? "private Output" : "Output", nr_out,
+                                 D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+                    g.list->CopyResource(nr_out, g.tex12[SLOT_COLOR]);
+                    Barrier(g.tex12[SLOT_COLOR], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    BarrierNamed(g.out_scratch != nullptr ? "private Output" : "Output", nr_out,
+                                 D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                }
+                else
+                {
+                    BarrierNamed(g.out_scratch != nullptr ? "private Output" : "Output", nr_out,
+                                 D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                }
                 FeedEndPhase(g.list);
 
                 const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
@@ -8040,8 +8097,19 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
                 // ever has one; the sign is what jitter_sign is for (see the README).
                 ep.InJitterOffsetX   = g.sr_active ? static_cast<float>(g_cfg.jitter_sign) * g.jitter_x : 0.0f;
                 ep.InJitterOffsetY   = g.sr_active ? static_cast<float>(g_cfg.jitter_sign) * g.jitter_y : 0.0f;
-                ep.InRenderSubrectDimensions.Width  = g.width;
-                ep.InRenderSubrectDimensions.Height = g.height;
+                UINT roi_x = 0, roi_y = 0, roi_w = g.width, roi_h = g.height;
+                const bool roi = g_cfg.roi_enabled != 0 && !g.sr_active && g.width == g.backbuffer_width && g.height == g.backbuffer_height;
+                if (roi)
+                {
+                    CenterRoi(g.width, g.height, &roi_x, &roi_y, &roi_w, &roi_h);
+                    ep.InColorSubrectBase.X = roi_x; ep.InColorSubrectBase.Y = roi_y;
+                    ep.InDepthSubrectBase.X = roi_x; ep.InDepthSubrectBase.Y = roi_y;
+                    ep.InMVSubrectBase.X = roi_x; ep.InMVSubrectBase.Y = roi_y;
+                    ep.InBiasCurrentColorSubrectBase.X = roi_x; ep.InBiasCurrentColorSubrectBase.Y = roi_y;
+                    ep.InOutputSubrectBase.X = roi_x; ep.InOutputSubrectBase.Y = roi_y;
+                }
+                ep.InRenderSubrectDimensions.Width  = roi_w;
+                ep.InRenderSubrectDimensions.Height = roi_h;
                 ep.InReset           = reset;
                 ep.InMVScaleX        = g_cfg.mv_scale_x;
                 ep.InMVScaleY        = g_cfg.mv_scale_y;
@@ -8880,6 +8948,28 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                                "mod that can lower the resolution of the neural pass alone, such as OptiScaler "
                                "DLSS-NR (WorkingScale under [DlssNr] in OptiScaler.ini).");
             ImGui::PopTextWrapPos();
+        }
+
+        ImGui::Separator();
+        bool roi = g_cfg.roi_enabled != 0;
+        if (ImGui::Checkbox("Center ROI v2 (NGX subrect)", &roi))
+        {
+            g_cfg.roi_enabled = roi ? 1 : 0;
+            dirty = true; rebuild = true;
+        }
+        ImGui::SameLine(); HelpMarker("D3D11 experimental path. Keeps stock full-size feeder resources and asks NGX to evaluate only a centered subrect. ROI OFF is stock 1.17.0. Requires Work resolution = 100%.");
+        if (roi)
+        {
+            if (ImGui::SliderInt("ROI width (%)", &g_cfg.roi_width, 25, 100)) dirty = true;
+            if (ImGui::SliderInt("ROI height (%)", &g_cfg.roi_height, 25, 100)) dirty = true;
+            if (ImGui::SliderInt("ROI center Y (%)", &g_cfg.roi_center_y, 20, 80)) dirty = true;
+            if (g.backbuffer_width != 0)
+            {
+                UINT rx, ry, rw, rh; CenterRoi(g.backbuffer_width, g.backbuffer_height, &rx, &ry, &rw, &rh);
+                ImGui::TextDisabled("Requested ROI: %ux%u at (%u,%u) of %ux%u", rw, rh, rx, ry, g.backbuffer_width, g.backbuffer_height);
+            }
+            if (g_cfg.work_resolution != 100)
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Set Work resolution to 100%% for ROI v2.");
         }
 
         // work_upscale=2 (DLSS reconstruction on synthetic jitter) is deliberately NOT on the
