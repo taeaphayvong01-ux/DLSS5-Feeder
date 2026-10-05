@@ -1,8 +1,8 @@
-name: build-center-roi-v2
+name: build-center-roi-r3-smooth-motion
 
 on:
   push:
-    branches: [center-roi-v2-1.17.0]
+    branches: [center-roi-r3-smooth-motion]
   workflow_dispatch:
 
 permissions:
@@ -15,10 +15,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: center-roi-v2-1.17.0
+          ref: center-roi-r3-smooth-motion
           fetch-depth: 0
 
-      - name: Verify Center ROI v2 source
+      - name: Verify Center ROI r3 Smooth Motion source
         shell: bash
         run: |
           set -euo pipefail
@@ -78,6 +78,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: dlss5-feeder-center-roi-v2
+          name: dlss5-feeder-center-roi-r3-smooth-motion
           path: artifacts/dlss5-feed.addon64
           if-no-files-found: error
