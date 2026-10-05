@@ -67,7 +67,7 @@
 #include "feed_pq12.h" // the D3D12 PQ<->linear pass, for the transports with no shaders of their own
 #include "feed_hold12.h" // the output stabiliser: one compute pass after the evaluate, all four transports
 
-#define FEED_VERSION "1.17.0-CenterROI-r2"
+#define FEED_VERSION "1.17.0-CenterROI-r3-SmoothMotion"
 #ifndef FEED_BUILD_ID
 #define FEED_BUILD_ID "unknown"
 #endif
@@ -8066,21 +8066,12 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
                 // one and the shared Output receives a copy below. Only the resource NGX
                 // actually writes gets promoted to UNORDERED_ACCESS.
                 ID3D12Resource *const nr_out = g.out_scratch != nullptr ? g.out_scratch : g.tex12[SLOT_OUTPUT];
-                if (g_cfg.roi_enabled != 0 && !g.sr_active && g.width == g.backbuffer_width && g.height == g.backbuffer_height)
-                {
-                    Barrier(g.tex12[SLOT_COLOR], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                    BarrierNamed(g.out_scratch != nullptr ? "private Output" : "Output", nr_out,
-                                 D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-                    g.list->CopyResource(nr_out, g.tex12[SLOT_COLOR]);
-                    Barrier(g.tex12[SLOT_COLOR], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                    BarrierNamed(g.out_scratch != nullptr ? "private Output" : "Output", nr_out,
-                                 D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                }
-                else
-                {
-                    BarrierNamed(g.out_scratch != nullptr ? "private Output" : "Output", nr_out,
-                                 D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                }
+                // r3: Do not seed Output with a full-frame Color CopyResource for ROI.
+                // Smooth Motion makes that extra copy/state round-trip show up as severe frame-time jitter.
+                // NGX writes only the requested output subrect; the untouched outer frame remains in the
+                // game's backbuffer and is never copied out or back.
+                BarrierNamed(g.out_scratch != nullptr ? "private Output" : "Output", nr_out,
+                             D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 FeedEndPhase(g.list);
 
                 const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
@@ -8147,7 +8138,22 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
                     // and both decay to COMMON when this submission completes -- the same shape
                     // the 64-bit helper uses for D3D11 clients that cannot open a UAV texture.
                     BarrierNamed("private Output", g.out_scratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                    g.list->CopyResource(g.tex12[SLOT_OUTPUT], g.out_scratch);
+                    if (roi)
+                    {
+                        // r3: move only the NGX-written ROI into the shared output texture.
+                        D3D12_TEXTURE_COPY_LOCATION dst = {};
+                        dst.pResource = g.tex12[SLOT_OUTPUT];
+                        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                        dst.SubresourceIndex = 0;
+                        D3D12_TEXTURE_COPY_LOCATION src = {};
+                        src.pResource = g.out_scratch;
+                        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                        src.SubresourceIndex = 0;
+                        D3D12_BOX box = { roi_x, roi_y, 0, roi_x + roi_w, roi_y + roi_h, 1 };
+                        g.list->CopyTextureRegion(&dst, roi_x, roi_y, 0, &src, &box);
+                    }
+                    else
+                        g.list->CopyResource(g.tex12[SLOT_OUTPUT], g.out_scratch);
                 }
                 else
                     BarrierNamed("Output", g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
@@ -8210,9 +8216,19 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
                                 static_cast<unsigned long long>(g.fence12->GetCompletedValue()),
                                 g.frame_slot, FormatName(g.output_fmt), g.out_scratch != nullptr,
                                 g_cfg.sync_home != 0);
-                        Breadcrumb("blitting the D3D12 output into the D3D11 backbuffer");
-                        BlitOutputToBackbuffer(ctx, rtv11);
-                        Breadcrumb("D3D11 output blit complete");
+                        Breadcrumb("copying the D3D12 output into the D3D11 backbuffer");
+                        if (roi)
+                        {
+                            // r3: preserve the original outer frame by touching only the ROI.
+                            // This is a direct GPU copy, avoiding the full-screen blit that made Smooth
+                            // Motion's pacing much more sensitive to the feeder.
+                            D3D11_BOX box = { roi_x, roi_y, 0, roi_x + roi_w, roi_y + roi_h, 1 };
+                            ctx->CopySubresourceRegion(color, 0, roi_x, roi_y, 0,
+                                                       g.tex11[SLOT_OUTPUT], 0, &box);
+                        }
+                        else
+                            BlitOutputToBackbuffer(ctx, rtv11);
+                        Breadcrumb("D3D11 output copy complete");
                         const UINT64 n = ++g.frames_done;
                         g.consecutive_fails = 0;
                         if (g.sr_active) ++g.jitter_index;
@@ -8952,12 +8968,12 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
 
         ImGui::Separator();
         bool roi = g_cfg.roi_enabled != 0;
-        if (ImGui::Checkbox("Center ROI v2 (NGX subrect)", &roi))
+        if (ImGui::Checkbox("Center ROI r3 (Smooth Motion)", &roi))
         {
             g_cfg.roi_enabled = roi ? 1 : 0;
             dirty = true; rebuild = true;
         }
-        ImGui::SameLine(); HelpMarker("D3D11 experimental path. Keeps stock full-size feeder resources and asks NGX to evaluate only a centered subrect. ROI OFF is stock 1.17.0. Requires Work resolution = 100%.");
+        ImGui::SameLine(); HelpMarker("D3D11 experimental path tuned for Smooth Motion. NGX evaluates a centered subrect and r3 copies only that ROI home; the outer backbuffer is left untouched. ROI OFF keeps the stock full-frame path. Requires Work resolution = 100%.");
         if (roi)
         {
             if (ImGui::SliderInt("ROI width (%)", &g_cfg.roi_width, 25, 100)) dirty = true;
